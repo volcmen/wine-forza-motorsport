@@ -10,6 +10,7 @@
  */
 
 #include "private.h"
+#include "wine/list.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(xgameruntime);
 
@@ -53,73 +54,133 @@ struct invite_poll_args
 
 struct invite_registration
 {
+    IXThreadingImpl *threading;
     XTaskQueueHandle queue;
     void *context;
     XGameInviteEventCallback callback;
     UINT64 token;
+    LONG refs;
+    UINT32 in_flight;
+    BOOL removed;
+    HANDLE idle_event;
+    struct list executing;
+};
+
+struct invite_execution
+{
+    struct list entry;
+    DWORD thread;
 };
 
 struct invite_post
 {
-    void *context;
-    XGameInviteEventCallback callback;
+    struct invite_registration *registration;
     char uri[1];
 };
 
 const GUID CLSID_XGameInviteImpl =
     {0x0651aae2, 0x4012, 0x4077, {0xbf, 0x84, 0x8b, 0x90, 0x97, 0x09, 0x0e, 0x2c}};
 
-static struct invite_registration invite_regs[MAX_INVITE_REGISTRATIONS];
+static struct invite_registration *invite_regs[MAX_INVITE_REGISTRATIONS];
 static SRWLOCK invite_regs_lock = SRWLOCK_INIT;
 static LONG invite_worker_started;
 static UINT64 invite_next_token = 1;
 static LONG invite_ref = 1;
 
-static void CALLBACK invite_trampoline( void *context, BOOLEAN canceled )
+static void invite_registration_addref( struct invite_registration *registration )
 {
-    struct invite_post *post = context;
-
-    if (!canceled) post->callback( post->context, post->uri );
-    free( post );
+    InterlockedIncrement( &registration->refs );
 }
 
-static void invite_deliver( const struct invite_registration *reg, const char *uri )
+static void invite_registration_release( struct invite_registration *registration )
 {
-    IXThreadingImpl *threading;
+    if (InterlockedDecrement( &registration->refs )) return;
+
+    if (registration->queue)
+        IXThreadingImpl_XTaskQueueCloseHandle( registration->threading,
+                                               registration->queue );
+    if (registration->threading) IXThreadingImpl_Release( registration->threading );
+    CloseHandle( registration->idle_event );
+    free( registration );
+}
+
+static void invite_post_release( struct invite_post *post )
+{
+    struct invite_registration *registration = post->registration;
+
+    free( post );
+    invite_registration_release( registration );
+}
+
+static void CALLBACK invite_trampoline( void *context, BOOLEAN canceled )
+{
+    struct invite_registration *registration;
+    struct invite_execution execution;
+    XGameInviteEventCallback callback = NULL;
+    void *callback_context = NULL;
+    struct invite_post *post = context;
+
+    registration = post->registration;
+    AcquireSRWLockExclusive( &invite_regs_lock );
+    if (!canceled && !registration->removed)
+    {
+        execution.thread = GetCurrentThreadId();
+        list_add_tail( &registration->executing, &execution.entry );
+        if (!registration->in_flight++) ResetEvent( registration->idle_event );
+        callback = registration->callback;
+        callback_context = registration->context;
+    }
+    ReleaseSRWLockExclusive( &invite_regs_lock );
+
+    if (callback) callback( callback_context, post->uri );
+
+    AcquireSRWLockExclusive( &invite_regs_lock );
+    if (callback)
+    {
+        list_remove( &execution.entry );
+        if (!--registration->in_flight) SetEvent( registration->idle_event );
+    }
+    ReleaseSRWLockExclusive( &invite_regs_lock );
+    invite_post_release( post );
+}
+
+static struct invite_post *invite_post_create( struct invite_registration *registration,
+                                               const char *uri )
+{
     struct invite_post *post;
     size_t length = strlen( uri );
+
+    if (!(post = malloc( offsetof(struct invite_post, uri) + length + 1 ))) return NULL;
+    post->registration = registration;
+    memcpy( post->uri, uri, length + 1 );
+    invite_registration_addref( registration );
+    return post;
+}
+
+static void invite_deliver( struct invite_post *post )
+{
+    struct invite_registration *registration = post->registration;
     HRESULT hr;
 
-    if (!(post = malloc( offsetof(struct invite_post, uri) + length + 1 ))) return;
-    post->context = reg->context;
-    post->callback = reg->callback;
-    memcpy( post->uri, uri, length + 1 );
-
-    if (!reg->queue)
+    if (!registration->queue)
     {
         invite_trampoline( post, FALSE );
         return;
     }
-    if (FAILED(hr = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl,
-                                  (void **)&threading )))
-    {
-        WARN( "could not get XThreading for invite delivery, hr %#lx.\n", hr );
-        free( post );
-        return;
-    }
-    hr = IXThreadingImpl_XTaskQueueSubmitCallback( threading, reg->queue,
+    hr = IXThreadingImpl_XTaskQueueSubmitCallback( registration->threading,
+                                                   registration->queue,
                                                    XTaskQueuePort_Completion, post,
                                                    invite_trampoline );
-    IXThreadingImpl_Release( threading );
     if (FAILED(hr))
     {
         WARN( "could not queue invite callback, hr %#lx.\n", hr );
-        free( post );
+        invite_post_release( post );
     }
 }
 
 static DWORD WINAPI invite_worker( void *unused )
 {
+    struct invite_post *posts[MAX_INVITE_REGISTRATIONS] = {0};
     struct invite_poll_args poll;
     NTSTATUS status;
     UINT32 i;
@@ -138,11 +199,19 @@ static DWORD WINAPI invite_worker( void *unused )
         status = __wine_unix_call( unixhandle, invite_poll_socket, &poll );
         if (status) break;
 
-        TRACE( "received Xbox invite activation %s.\n", debugstr_a(poll.uri) );
-        AcquireSRWLockShared( &invite_regs_lock );
+        TRACE( "received Xbox invite activation (%u bytes).\n", poll.length );
+        AcquireSRWLockExclusive( &invite_regs_lock );
         for (i = 0; i < MAX_INVITE_REGISTRATIONS; ++i)
-            if (invite_regs[i].callback) invite_deliver( &invite_regs[i], poll.uri );
-        ReleaseSRWLockShared( &invite_regs_lock );
+            if (invite_regs[i] && !invite_regs[i]->removed)
+                posts[i] = invite_post_create( invite_regs[i], poll.uri );
+        ReleaseSRWLockExclusive( &invite_regs_lock );
+
+        for (i = 0; i < MAX_INVITE_REGISTRATIONS; ++i)
+            if (posts[i])
+            {
+                invite_deliver( posts[i] );
+                posts[i] = NULL;
+            }
     }
 
     __wine_unix_call( unixhandle, invite_close_socket, NULL );
@@ -177,6 +246,7 @@ static HRESULT WINAPI game_invite_RegisterForEvent( IXGameInviteImpl *iface,
         XTaskQueueHandle queue, void *context, XGameInviteEventCallback callback,
         XTaskQueueRegistrationToken *token )
 {
+    struct invite_registration *registration;
     IXThreadingImpl *threading;
     HANDLE thread;
     UINT32 i;
@@ -185,44 +255,74 @@ static HRESULT WINAPI game_invite_RegisterForEvent( IXGameInviteImpl *iface,
     TRACE( "iface %p, queue %p, context %p, callback %p, token %p.\n",
            iface, queue, context, callback, token );
     if (!callback || !token) return E_POINTER;
+    token->token = 0;
 
-    AcquireSRWLockExclusive( &invite_regs_lock );
-    for (i = 0; i < MAX_INVITE_REGISTRATIONS; ++i) if (!invite_regs[i].callback) break;
-    if (i == MAX_INVITE_REGISTRATIONS)
+    if (!(registration = calloc( 1, sizeof(*registration) ))) return E_OUTOFMEMORY;
+    registration->refs = 1;
+    registration->context = context;
+    registration->callback = callback;
+    list_init( &registration->executing );
+    if (!(registration->idle_event = CreateEventW( NULL, TRUE, TRUE, NULL )))
     {
-        ReleaseSRWLockExclusive( &invite_regs_lock );
-        return E_OUTOFMEMORY;
+        free( registration );
+        return HRESULT_FROM_WIN32( GetLastError() );
     }
 
-    invite_regs[i].queue = NULL;
     if (queue)
     {
         if (FAILED(hr = QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl,
                                       (void **)&threading )))
         {
-            ReleaseSRWLockExclusive( &invite_regs_lock );
+            invite_registration_release( registration );
             return hr;
         }
-        hr = IXThreadingImpl_XTaskQueueDuplicateHandle( threading, queue, &invite_regs[i].queue );
-        IXThreadingImpl_Release( threading );
+        registration->threading = threading;
+        hr = IXThreadingImpl_XTaskQueueDuplicateHandle( threading, queue,
+                                                        &registration->queue );
         if (FAILED(hr))
         {
-            ReleaseSRWLockExclusive( &invite_regs_lock );
+            invite_registration_release( registration );
             return hr;
         }
     }
-    invite_regs[i].context = context;
-    invite_regs[i].callback = callback;
-    invite_regs[i].token = invite_next_token++;
-    token->token = invite_regs[i].token;
+
+    AcquireSRWLockExclusive( &invite_regs_lock );
+    for (i = 0; i < MAX_INVITE_REGISTRATIONS; ++i) if (!invite_regs[i]) break;
+    if (i == MAX_INVITE_REGISTRATIONS)
+    {
+        ReleaseSRWLockExclusive( &invite_regs_lock );
+        invite_registration_release( registration );
+        return E_OUTOFMEMORY;
+    }
+
+    do
+    {
+        UINT32 j;
+
+        registration->token = invite_next_token++;
+        if (!registration->token) continue;
+        for (j = 0; j < MAX_INVITE_REGISTRATIONS; ++j)
+            if (invite_regs[j] && invite_regs[j]->token == registration->token) break;
+        if (j == MAX_INVITE_REGISTRATIONS) break;
+    } while (TRUE);
+    invite_regs[i] = registration;
+    token->token = registration->token;
     ReleaseSRWLockExclusive( &invite_regs_lock );
 
     if (InterlockedCompareExchange( &invite_worker_started, 1, 0 ) == 0)
     {
         if (!(thread = CreateThread( NULL, 0, invite_worker, NULL, 0, NULL )))
         {
+            DWORD error = GetLastError();
+
             InterlockedExchange( &invite_worker_started, 0 );
-            return HRESULT_FROM_WIN32( GetLastError() );
+            AcquireSRWLockExclusive( &invite_regs_lock );
+            if (invite_regs[i] == registration) invite_regs[i] = NULL;
+            registration->removed = TRUE;
+            ReleaseSRWLockExclusive( &invite_regs_lock );
+            token->token = 0;
+            invite_registration_release( registration );
+            return HRESULT_FROM_WIN32( error );
         }
         CloseHandle( thread );
     }
@@ -232,7 +332,9 @@ static HRESULT WINAPI game_invite_RegisterForEvent( IXGameInviteImpl *iface,
 static BOOLEAN WINAPI game_invite_UnregisterForEvent( IXGameInviteImpl *iface,
         XTaskQueueRegistrationToken token, BOOLEAN wait )
 {
-    IXThreadingImpl *threading;
+    struct invite_execution *execution;
+    struct invite_registration *registration = NULL;
+    BOOL drained, self = FALSE;
     UINT32 i;
 
     TRACE( "iface %p, token %llu, wait %d.\n", iface,
@@ -240,20 +342,27 @@ static BOOLEAN WINAPI game_invite_UnregisterForEvent( IXGameInviteImpl *iface,
     AcquireSRWLockExclusive( &invite_regs_lock );
     for (i = 0; i < MAX_INVITE_REGISTRATIONS; ++i)
     {
-        if (!invite_regs[i].callback || invite_regs[i].token != token.token) continue;
-        if (invite_regs[i].queue &&
-            SUCCEEDED(QueryApiImpl( &CLSID_XThreadingImpl, &IID_IXThreadingImpl,
-                                    (void **)&threading )))
-        {
-            IXThreadingImpl_XTaskQueueCloseHandle( threading, invite_regs[i].queue );
-            IXThreadingImpl_Release( threading );
-        }
-        memset( &invite_regs[i], 0, sizeof(invite_regs[i]) );
-        ReleaseSRWLockExclusive( &invite_regs_lock );
-        return TRUE;
+        if (!invite_regs[i] || invite_regs[i]->token != token.token) continue;
+        registration = invite_regs[i];
+        invite_regs[i] = NULL;
+        registration->removed = TRUE;
+        LIST_FOR_EACH_ENTRY( execution, &registration->executing,
+                             struct invite_execution, entry )
+            if (execution->thread == GetCurrentThreadId())
+            {
+                self = TRUE;
+                break;
+            }
+        break;
     }
+    drained = registration && !registration->in_flight;
     ReleaseSRWLockExclusive( &invite_regs_lock );
-    return FALSE;
+    if (!registration) return FALSE;
+
+    if (wait && !self && !drained)
+        drained = WaitForSingleObject( registration->idle_event, INFINITE ) == WAIT_OBJECT_0;
+    invite_registration_release( registration );
+    return !wait || self || drained;
 }
 
 static const IXGameInviteImplVtbl game_invite_vtbl =

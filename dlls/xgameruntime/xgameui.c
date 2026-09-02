@@ -151,7 +151,7 @@ static HRESULT WINAPI x_game_ui_XGameUiShowMessageDialogResult( IXGameUiImpl4 *i
 
 static HRESULT WINAPI x_game_ui_XGameUiShowSendGameInviteAsync( IXGameUiImpl4 *iface, XAsyncBlock *async, XUserHandle requestingUser, const char *sessionConfigurationId, const char *sessionTemplateName, const char *sessionId, const char *invitationText, const char *customActivationContext )
 {
-    TRACE( "iface %p, async %p, requestingUser %p, sessionConfigurationId %s, sessionTemplateName %s, sessionId %s, invitationText %s, customActivationContext %s.\n", iface, async, requestingUser, debugstr_a( sessionConfigurationId ), debugstr_a( sessionTemplateName ), debugstr_a( sessionId ), debugstr_a( invitationText ), debugstr_a( customActivationContext ) );
+    TRACE( "iface %p, async %p, requestingUser %p.\n", iface, async, requestingUser );
     return start_forza_social_ui( async, "XGameUiShowSendGameInviteAsync" );
 }
 
