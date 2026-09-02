@@ -74,7 +74,10 @@ struct invite_execution
 
 struct invite_post
 {
+    struct list entry;
     struct invite_registration *registration;
+    LONG refs;
+    ULONG_PTR token;
     char uri[1];
 };
 
@@ -82,9 +85,11 @@ const GUID CLSID_XGameInviteImpl =
     {0x0651aae2, 0x4012, 0x4077, {0xbf, 0x84, 0x8b, 0x90, 0x97, 0x09, 0x0e, 0x2c}};
 
 static struct invite_registration *invite_regs[MAX_INVITE_REGISTRATIONS];
+static struct list invite_posts = LIST_INIT( invite_posts );
 static SRWLOCK invite_regs_lock = SRWLOCK_INIT;
 static LONG invite_worker_started;
 static UINT64 invite_next_token = 1;
+static ULONG_PTR invite_next_post_token = 1;
 static LONG invite_ref = 1;
 
 static void invite_registration_addref( struct invite_registration *registration )
@@ -108,8 +113,23 @@ static void invite_post_release( struct invite_post *post )
 {
     struct invite_registration *registration = post->registration;
 
+    if (InterlockedDecrement( &post->refs )) return;
     free( post );
     invite_registration_release( registration );
+}
+
+/* Must be called with invite_regs_lock held exclusively. */
+static struct invite_post *invite_post_claim( ULONG_PTR token )
+{
+    struct invite_post *post;
+
+    LIST_FOR_EACH_ENTRY( post, &invite_posts, struct invite_post, entry )
+    {
+        if (post->token != token) continue;
+        list_remove( &post->entry );
+        return post;
+    }
+    return NULL;
 }
 
 static void CALLBACK invite_trampoline( void *context, BOOLEAN canceled )
@@ -118,10 +138,16 @@ static void CALLBACK invite_trampoline( void *context, BOOLEAN canceled )
     struct invite_execution execution;
     XGameInviteEventCallback callback = NULL;
     void *callback_context = NULL;
-    struct invite_post *post = context;
+    struct invite_post *post;
+    ULONG_PTR token = (ULONG_PTR)context;
 
-    registration = post->registration;
     AcquireSRWLockExclusive( &invite_regs_lock );
+    if (!(post = invite_post_claim( token )))
+    {
+        ReleaseSRWLockExclusive( &invite_regs_lock );
+        return;
+    }
+    registration = post->registration;
     if (!canceled && !registration->removed)
     {
         execution.thread = GetCurrentThreadId();
@@ -150,32 +176,45 @@ static struct invite_post *invite_post_create( struct invite_registration *regis
     struct invite_post *post;
     size_t length = strlen( uri );
 
+    /* The caller holds invite_regs_lock, so a token is never reused after wrap. */
+    if (!invite_next_post_token) return NULL;
     if (!(post = malloc( offsetof(struct invite_post, uri) + length + 1 ))) return NULL;
     post->registration = registration;
+    post->refs = 2; /* pending-list ownership plus the submitting worker */
+    post->token = invite_next_post_token++;
     memcpy( post->uri, uri, length + 1 );
     invite_registration_addref( registration );
+    list_add_tail( &invite_posts, &post->entry );
     return post;
 }
 
 static void invite_deliver( struct invite_post *post )
 {
     struct invite_registration *registration = post->registration;
+    struct invite_post *pending;
+    ULONG_PTR token = post->token;
     HRESULT hr;
 
     if (!registration->queue)
     {
-        invite_trampoline( post, FALSE );
+        invite_trampoline( (void *)token, FALSE );
+        invite_post_release( post );
         return;
     }
     hr = IXThreadingImpl_XTaskQueueSubmitCallback( registration->threading,
                                                    registration->queue,
-                                                   XTaskQueuePort_Completion, post,
+                                                   XTaskQueuePort_Completion,
+                                                   (void *)token,
                                                    invite_trampoline );
     if (FAILED(hr))
     {
         WARN( "could not queue invite callback, hr %#lx.\n", hr );
-        invite_post_release( post );
+        AcquireSRWLockExclusive( &invite_regs_lock );
+        pending = invite_post_claim( token );
+        ReleaseSRWLockExclusive( &invite_regs_lock );
+        if (pending) invite_post_release( pending );
     }
+    invite_post_release( post );
 }
 
 static DWORD WINAPI invite_worker( void *unused )
@@ -333,6 +372,8 @@ static BOOLEAN WINAPI game_invite_UnregisterForEvent( IXGameInviteImpl *iface,
         XTaskQueueRegistrationToken token, BOOLEAN wait )
 {
     struct invite_execution *execution;
+    struct invite_post *post, *post_next;
+    struct list canceled = LIST_INIT( canceled );
     struct invite_registration *registration = NULL;
     BOOL drained, self = FALSE;
     UINT32 i;
@@ -346,6 +387,13 @@ static BOOLEAN WINAPI game_invite_UnregisterForEvent( IXGameInviteImpl *iface,
         registration = invite_regs[i];
         invite_regs[i] = NULL;
         registration->removed = TRUE;
+        LIST_FOR_EACH_ENTRY_SAFE( post, post_next, &invite_posts,
+                                  struct invite_post, entry )
+        {
+            if (post->registration != registration) continue;
+            list_remove( &post->entry );
+            list_add_tail( &canceled, &post->entry );
+        }
         LIST_FOR_EACH_ENTRY( execution, &registration->executing,
                              struct invite_execution, entry )
             if (execution->thread == GetCurrentThreadId())
@@ -358,6 +406,13 @@ static BOOLEAN WINAPI game_invite_UnregisterForEvent( IXGameInviteImpl *iface,
     drained = registration && !registration->in_flight;
     ReleaseSRWLockExclusive( &invite_regs_lock );
     if (!registration) return FALSE;
+
+    LIST_FOR_EACH_ENTRY_SAFE( post, post_next, &canceled,
+                              struct invite_post, entry )
+    {
+        list_remove( &post->entry );
+        invite_post_release( post );
+    }
 
     if (wait && !self && !drained)
         drained = WaitForSingleObject( registration->idle_event, INFINITE ) == WAIT_OBJECT_0;

@@ -159,7 +159,12 @@ static void test_xgameui_query(void)
     hr = query_api( &CLSID_XGameUiImpl, &IID_IUnknown, (void **)&xgameui );
     ok( hr == S_OK, "QueryApiImpl(XGameUi) returned %#lx\n", hr );
     ok( !!xgameui, "QueryApiImpl(XGameUi) returned a null interface\n" );
-    if (xgameui) IUnknown_Release( xgameui );
+    if (xgameui)
+    {
+        hr = IUnknown_QueryInterface( xgameui, &IID_IUnknown, NULL );
+        ok( hr == E_POINTER, "XGameUi QueryInterface(NULL) returned %#lx\n", hr );
+        IUnknown_Release( xgameui );
+    }
 
     xgameui = NULL;
     hr = query_api( &CLSID_XGameUiImpl, &IID_IXGameUiImpl2, (void **)&xgameui );
@@ -216,6 +221,14 @@ static void CALLBACK invite_received_delayed( void *context, const char *invite_
     InterlockedIncrement( &state->calls );
     SetEvent( state->event );
     WaitForSingleObject( state->release, 30000 );
+}
+
+static void CALLBACK invite_received_suppressed( void *context, const char *invite_uri )
+{
+    struct invite_test_state *state = context;
+
+    InterlockedIncrement( &state->calls );
+    SetEvent( state->event );
 }
 
 static void CALLBACK invite_received_self_unregister( void *context, const char *invite_uri )
@@ -281,16 +294,18 @@ static void restore_threading_prompt( HKEY key, BOOL had_value, DWORD previous )
 static void test_xgameinvite_relay(void)
 {
     static const char expected_uri[] =
-        "ms-xbl-multiplayer://inviteAccept?invitedUser=1&sender=2&connectionString=test%20relay";
+        "ms-xbl-multiplayer://inviteAccept?"
+        "invitedUser=123456789&sender=987654321&connectionString=fixture";
     static const char config[] = "<Game><TitleId>6DD4E56D</TitleId></Game>";
     struct initialize_options options = {0, TRUE, config};
-    struct invite_test_state state = {0}, self_state = {0};
+    struct invite_test_state state = {0}, suppressed_state = {0}, self_state = {0};
     struct unregister_test_state unregister_state = {0};
     struct dispatch_test_state dispatch_state = {0};
     initialize_api_impl_ex2_fn initialize;
     query_api_impl_fn query_api;
-    XTaskQueueRegistrationToken token, reuse_token, previous_token = {0};
-    XTaskQueueHandle manual_queue = NULL, dispatch_queue = NULL, immediate_queue = NULL;
+    XTaskQueueRegistrationToken token, suppressed_token, reuse_token, previous_token = {0};
+    XTaskQueueHandle manual_queue = NULL, dispatch_queue = NULL, undispatched_queue = NULL;
+    XTaskQueueHandle immediate_queue = NULL;
     threading_iface *threading = NULL;
     invite_iface *invite = NULL;
     HANDLE unregister_handle = NULL, dispatch_handle = NULL;
@@ -348,18 +363,30 @@ static void test_xgameinvite_relay(void)
                                               &immediate_queue );
     ok( hr == S_OK, "XTaskQueueCreate(immediate) returned %#lx\n", hr );
     if (FAILED(hr)) goto done;
+    hr = threading->lpVtbl->XTaskQueueCreate( threading, XTaskQueueDispatchMode_Manual,
+                                              XTaskQueueDispatchMode_Manual,
+                                              &undispatched_queue );
+    ok( hr == S_OK, "XTaskQueueCreate(undispatched manual) returned %#lx\n", hr );
+    if (FAILED(hr)) goto done;
 
     state.event = CreateEventW( NULL, TRUE, FALSE, NULL );
     state.release = CreateEventW( NULL, TRUE, FALSE, NULL );
+    suppressed_state.event = CreateEventW( NULL, TRUE, FALSE, NULL );
     self_state.event = CreateEventW( NULL, TRUE, FALSE, NULL );
     ok( !!state.event, "CreateEvent failed, error %lu\n", GetLastError() );
     ok( !!state.release, "CreateEvent failed, error %lu\n", GetLastError() );
+    ok( !!suppressed_state.event, "CreateEvent failed, error %lu\n", GetLastError() );
     ok( !!self_state.event, "CreateEvent failed, error %lu\n", GetLastError() );
-    if (!state.event || !state.release || !self_state.event) goto done;
+    if (!state.event || !state.release || !suppressed_state.event || !self_state.event)
+        goto done;
 
     hr = invite->lpVtbl->RegisterForEvent( invite, manual_queue, &state,
                                            invite_received_delayed, &token );
     ok( hr == S_OK, "XGameInviteRegisterForEvent returned %#lx\n", hr );
+    if (FAILED(hr)) goto done;
+    hr = invite->lpVtbl->RegisterForEvent( invite, undispatched_queue, &suppressed_state,
+                                           invite_received_suppressed, &suppressed_token );
+    ok( hr == S_OK, "undispatched XGameInviteRegisterForEvent returned %#lx\n", hr );
     if (FAILED(hr)) goto done;
     self_state.invite = invite;
     hr = invite->lpVtbl->RegisterForEvent( invite, immediate_queue, &self_state,
@@ -377,6 +404,15 @@ static void test_xgameinvite_relay(void)
     ok( self_state.unregister_result, "callback self-unregister failed\n" );
     ok( self_state.calls == 1, "self-unregister callback ran %ld times\n", self_state.calls );
     if (wait != WAIT_OBJECT_0) goto done;
+
+    threading->lpVtbl->XTaskQueueCloseHandle( threading, undispatched_queue );
+    undispatched_queue = NULL;
+    ok( invite->lpVtbl->UnregisterForEvent( invite, suppressed_token, TRUE ),
+        "undispatched manual queue unregister failed\n" );
+    wait = WaitForSingleObject( suppressed_state.event, 200 );
+    ok( wait == WAIT_TIMEOUT, "undispatched callback was not suppressed, wait %#lx\n", wait );
+    ok( !suppressed_state.calls, "undispatched callback ran %ld times\n",
+        suppressed_state.calls );
 
     dispatch_state.threading = threading;
     dispatch_state.queue = dispatch_queue;
@@ -423,6 +459,10 @@ static void test_xgameinvite_relay(void)
         previous_token = reuse_token;
     }
 
+    i = threading->lpVtbl->Release( threading );
+    threading = NULL;
+    ok( i == 1, "invite teardown retained %u threading references\n", i - 1 );
+
 done:
     SetEvent( state.release );
     if (unregister_handle) CloseHandle( unregister_handle );
@@ -431,11 +471,14 @@ done:
     if (dispatch_state.done) CloseHandle( dispatch_state.done );
     if (state.event) CloseHandle( state.event );
     if (state.release) CloseHandle( state.release );
+    if (suppressed_state.event) CloseHandle( suppressed_state.event );
     if (self_state.event) CloseHandle( self_state.event );
     if (threading && immediate_queue)
         threading->lpVtbl->XTaskQueueCloseHandle( threading, immediate_queue );
     if (threading && dispatch_queue)
         threading->lpVtbl->XTaskQueueCloseHandle( threading, dispatch_queue );
+    if (threading && undispatched_queue)
+        threading->lpVtbl->XTaskQueueCloseHandle( threading, undispatched_queue );
     if (threading && manual_queue)
         threading->lpVtbl->XTaskQueueCloseHandle( threading, manual_queue );
     if (threading) threading->lpVtbl->Release( threading );

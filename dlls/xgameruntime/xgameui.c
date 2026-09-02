@@ -45,6 +45,7 @@ static HRESULT WINAPI x_game_ui_QueryInterface( IXGameUiImpl4 *iface, REFIID iid
     struct x_game_ui *impl = impl_from_IXGameUiImpl4( iface );
 
     TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
+    if (!out) return E_POINTER;
 
     if (IsEqualGUID( iid, &IID_IUnknown      ) ||
         IsEqualGUID( iid, &IID_IXGameUiImpl  ) ||
@@ -151,7 +152,7 @@ static HRESULT WINAPI x_game_ui_XGameUiShowMessageDialogResult( IXGameUiImpl4 *i
 
 static HRESULT WINAPI x_game_ui_XGameUiShowSendGameInviteAsync( IXGameUiImpl4 *iface, XAsyncBlock *async, XUserHandle requestingUser, const char *sessionConfigurationId, const char *sessionTemplateName, const char *sessionId, const char *invitationText, const char *customActivationContext )
 {
-    TRACE( "iface %p, async %p, requestingUser %p.\n", iface, async, requestingUser );
+    TRACE( "iface %p, async %p.\n", iface, async );
     return start_forza_social_ui( async, "XGameUiShowSendGameInviteAsync" );
 }
 
@@ -301,7 +302,7 @@ static HRESULT WINAPI __PADDING_6__( IXGameUiImpl4 *iface )
 
 static HRESULT WINAPI x_game_ui_XGameUiShowMultiplayerActivityGameInviteAsync( IXGameUiImpl4 *iface, XAsyncBlock *async, XUserHandle requestingUser )
 {
-    TRACE( "iface %p, async %p, requestingUser %p.\n", iface, async, requestingUser );
+    TRACE( "iface %p, async %p.\n", iface, async );
     return start_forza_social_ui( async,
                                  "XGameUiShowMultiplayerActivityGameInviteAsync" );
 }
