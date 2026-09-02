@@ -459,6 +459,10 @@ static void test_xgameinvite_relay(void)
         previous_token = reuse_token;
     }
 
+    threading->lpVtbl->XTaskQueueCloseHandle( threading, immediate_queue );
+    immediate_queue = NULL;
+    threading->lpVtbl->XTaskQueueCloseHandle( threading, dispatch_queue );
+    dispatch_queue = NULL;
     i = threading->lpVtbl->Release( threading );
     threading = NULL;
     ok( i == 1, "invite teardown retained %u threading references\n", i - 1 );
