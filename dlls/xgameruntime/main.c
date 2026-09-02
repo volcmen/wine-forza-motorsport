@@ -327,6 +327,9 @@ HRESULT WINAPI InitializeApiImpl( ULONG gdkVer, ULONG gsVer )
 
 typedef HRESULT (WINAPI *QueryApiImpl_ext)( const GUID *runtimeClassId, REFIID interfaceId, void **out );
 
+extern const GUID CLSID_XGameInviteImpl;
+HRESULT x_game_invite_query( REFIID iid, void **out );
+
 HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, void **out )
 {
     QueryApiImpl_ext func = (QueryApiImpl_ext)GetProcAddress( xgameruntime_threading, "QueryApiImpl" );
@@ -355,6 +358,8 @@ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, voi
     }
     if (IsEqualGUID( runtimeClassId, &CLSID_XGameImpl ))
         return IXGameImpl_QueryInterface( x_game, interfaceId, out );
+    if (IsEqualGUID( runtimeClassId, &CLSID_XGameInviteImpl ))
+        return x_game_invite_query( interfaceId, out );
     if (IsEqualGUID( runtimeClassId, &CLSID_XGameUiImpl ))
         return IXGameUiImpl_QueryInterface( x_game_ui_impl, interfaceId, out );
     if (IsEqualGUID( runtimeClassId, &CLSID_XUserImpl ))

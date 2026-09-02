@@ -107,8 +107,17 @@ WINE_DEFAULT_DEBUG_CHANNEL(xodus);
 
 // Persist connection
 static int sockfd = 0;
+static int invite_sockfd = -1;
 
+#define INVITE_SUBSCRIBE_MAGIC 0x49534458 /* "XDSI" as little endian */
 #define SOCIAL_UI_MAGIC 0x49554458 /* "XDUI" as little endian */
+#define MAX_INVITE_URI 4096
+
+typedef struct _INVITE_POLL_ARGS
+{
+    UINT32 length;
+    char uri[MAX_INVITE_URI + 1];
+} INVITE_POLL_ARGS;
 
 /*
  * The title sends frames from several threads at once - a Ping from the init
@@ -367,6 +376,47 @@ static int read_all( int fd, void *buffer, size_t length )
     return 0;
 }
 
+static NTSTATUS invite_conn_sock( void *args )
+{
+    UINT32 magic = INVITE_SUBSCRIBE_MAGIC;
+
+    if (invite_sockfd >= 0) return STATUS_SUCCESS;
+    if ((invite_sockfd = connect_invite_fd( args )) < 0) return STATUS_CONNECTION_REFUSED;
+    if (write_all( invite_sockfd, &magic, sizeof(magic) ) < 0)
+    {
+        close( invite_sockfd );
+        invite_sockfd = -1;
+        return STATUS_CONNECTION_RESET;
+    }
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS invite_poll_sock( void *args )
+{
+    INVITE_POLL_ARGS *poll = args;
+
+    if (invite_sockfd < 0) return STATUS_CONNECTION_INVALID;
+    if (read_all( invite_sockfd, &poll->length, sizeof(poll->length) ) < 0)
+        return STATUS_CONNECTION_DISCONNECTED;
+    if (!poll->length || poll->length > MAX_INVITE_URI)
+        return STATUS_INVALID_BUFFER_SIZE;
+    if (read_all( invite_sockfd, poll->uri, poll->length ) < 0)
+        return STATUS_CONNECTION_DISCONNECTED;
+    poll->uri[poll->length] = 0;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS invite_close_sock( void *args )
+{
+    if (invite_sockfd >= 0)
+    {
+        shutdown( invite_sockfd, SHUT_RDWR );
+        close( invite_sockfd );
+        invite_sockfd = -1;
+    }
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS show_forza_social_ui( void *args )
 {
     UINT32 magic = SOCIAL_UI_MAGIC;
@@ -389,5 +439,8 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     conn_sock,
     poll_sock,
     send_frm,
+    invite_conn_sock,
+    invite_poll_sock,
+    invite_close_sock,
     show_forza_social_ui,
 };
