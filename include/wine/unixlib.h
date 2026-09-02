@@ -29,6 +29,10 @@
 
 typedef UINT64 unixlib_handle_t;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #ifdef WINE_UNIX_LIB
 
 typedef NTSTATUS (*unixlib_entry_t)( void *args );
@@ -291,5 +295,9 @@ static inline NTSTATUS __wine_unix_call( unixlib_handle_t handle, unsigned int c
 #define WINE_UNIX_CALL(code,args) __wine_unix_call( __wine_unixlib_handle, (code), (args) )
 
 #endif /* WINE_UNIX_LIB */
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif  /* __WINE_WINE_UNIXLIB_H */

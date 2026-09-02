@@ -101,6 +101,10 @@
 #define IPC_REQUEST_TIMEOUT_MS 5000
 #define XODUS_INTEROP 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 extern BOOLEAN initializeCalled;
 
 extern char *msaAppId;
@@ -128,7 +132,11 @@ extern IXodusService *xodus_service;
 extern IXodusXMLBuilder *xodus_xml_builder;
 #endif
 
-EXTERN_C HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, void **out );
+HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, void **out );
+
+#ifdef __cplusplus
+}
+#endif
 
 typedef struct _INITIALIZE_OPTIONS
 {
