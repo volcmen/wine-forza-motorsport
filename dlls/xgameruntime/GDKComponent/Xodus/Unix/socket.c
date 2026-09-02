@@ -108,6 +108,8 @@ WINE_DEFAULT_DEBUG_CHANNEL(xodus);
 // Persist connection
 static int sockfd = 0;
 
+#define SOCIAL_UI_MAGIC 0x49554458 /* "XDUI" as little endian */
+
 /*
  * The title sends frames from several threads at once - a Ping from the init
  * thread, then MSA and XSTS token requests from async workers, two of which can
@@ -279,9 +281,113 @@ static NTSTATUS send_frm( void *args )
     return STATUS_SUCCESS;
 }
 
+static int connect_invite_fd( const char *socket_suffix )
+{
+    struct sockaddr_un addr;
+    const char *override = getenv( "WINEGDK_XODUS_SOCKET" );
+    const char *runtime;
+    char *socket_path;
+    size_t len;
+    int fd;
+
+    if (override && *override)
+    {
+        if (!(socket_path = strdup( override ))) return -1;
+    }
+    else
+    {
+#ifdef __linux__
+        if (!(runtime = getenv( "XDG_RUNTIME_DIR" ))) return -1;
+#elif defined(__APPLE__)
+        runtime = "/tmp";
+#endif
+        len = strlen( runtime ) + strlen( socket_suffix ) + 2;
+        if (!(socket_path = malloc( len ))) return -1;
+        snprintf( socket_path, len, "%s/%s", runtime, socket_suffix );
+    }
+    if (strlen( socket_path ) >= sizeof(addr.sun_path))
+    {
+        free( socket_path );
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    if ((fd = socket( AF_UNIX, SOCK_STREAM, 0 )) < 0)
+    {
+        free( socket_path );
+        return -1;
+    }
+    memset( &addr, 0, sizeof(addr) );
+    addr.sun_family = AF_UNIX;
+    lstrcpynA( addr.sun_path, socket_path, sizeof(addr.sun_path) );
+    free( socket_path );
+    if (connect( fd, (struct sockaddr *)&addr, sizeof(addr) ) < 0)
+    {
+        close( fd );
+        return -1;
+    }
+    return fd;
+}
+
+static int write_all( int fd, const void *buffer, size_t length )
+{
+    const char *cursor = buffer;
+    ssize_t count;
+
+    while (length)
+    {
+        if ((count = write( fd, cursor, length )) < 0)
+        {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (!count) return -1;
+        cursor += count;
+        length -= count;
+    }
+    return 0;
+}
+
+static int read_all( int fd, void *buffer, size_t length )
+{
+    char *cursor = buffer;
+    ssize_t count;
+
+    while (length)
+    {
+        if ((count = read( fd, cursor, length )) < 0)
+        {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (!count) return -1;
+        cursor += count;
+        length -= count;
+    }
+    return 0;
+}
+
+static NTSTATUS show_forza_social_ui( void *args )
+{
+    UINT32 magic = SOCIAL_UI_MAGIC;
+    unsigned char status;
+    int fd;
+
+    if ((fd = connect_invite_fd( args )) < 0) return STATUS_CONNECTION_REFUSED;
+    if (write_all( fd, &magic, sizeof(magic) ) < 0 ||
+        read_all( fd, &status, sizeof(status) ) < 0)
+    {
+        close( fd );
+        return STATUS_CONNECTION_RESET;
+    }
+    close( fd );
+    return status ? STATUS_UNSUCCESSFUL : STATUS_SUCCESS;
+}
+
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     conn_sock,
     poll_sock,
-    send_frm
+    send_frm,
+    show_forza_social_ui,
 };

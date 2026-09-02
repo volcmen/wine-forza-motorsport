@@ -239,9 +239,11 @@ _INIT:
 
     if (options)
     {
-        if (options->isInlineConfig && !(config = xmlReadMemory( options->gameConfig, strlen( options->gameConfig ), NULL, NULL, 0 )))
-            return E_GAMERUNTIME_GAMECONFIG_BAD_FORMAT;
-        else if (!(config = xmlReadFile( options->gameConfig, NULL, 0 )))
+        if (options->isInlineConfig)
+            config = xmlReadMemory( options->gameConfig, strlen( options->gameConfig ), NULL, NULL, 0 );
+        else
+            config = xmlReadFile( options->gameConfig, NULL, 0 );
+        if (!config)
             return E_GAMERUNTIME_GAMECONFIG_BAD_FORMAT;
     }
     else
@@ -332,7 +334,6 @@ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, voi
 
     TRACE( "runtimeClassId %s, interfaceId %s, out %p\n",
            debugstr_guid( runtimeClassId ), debugstr_guid( interfaceId ), out );
-
     if (IsEqualGUID( runtimeClassId, &CLSID_XPersistentLocalStorageImpl ))
         return persistent_local_storage_query( interfaceId, out );
     if (IsEqualGUID( runtimeClassId, &CLSID_XSystemImpl ))
@@ -354,6 +355,8 @@ HRESULT WINAPI QueryApiImpl( const GUID *runtimeClassId, REFIID interfaceId, voi
     }
     if (IsEqualGUID( runtimeClassId, &CLSID_XGameImpl ))
         return IXGameImpl_QueryInterface( x_game, interfaceId, out );
+    if (IsEqualGUID( runtimeClassId, &CLSID_XGameUiImpl ))
+        return IXGameUiImpl_QueryInterface( x_game_ui_impl, interfaceId, out );
     if (IsEqualGUID( runtimeClassId, &CLSID_XUserImpl ))
         return IXUserImpl6_QueryInterface( x_user, interfaceId, out );
     if (IsEqualGUID( runtimeClassId, &CLSID_XUserDeviceImpl ))

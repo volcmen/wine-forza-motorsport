@@ -7,6 +7,8 @@ SOURCES = \
 	main.c \
 	persistentlocalstorage.c \
 	titlequirks.c \
+	xgameui.c \
+	xgameui.idl \
 	userprovider.idl \
 	util.c \
 	xodusprovider.idl \
