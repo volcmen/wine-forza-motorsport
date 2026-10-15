@@ -807,8 +807,6 @@ HRESULT WINAPI XAsyncSchedule(
 
     state.Detach();
 
-    TRACE("Before completion, queue here was %p\n", state->queue);
-
     return S_OK;
 }
 
