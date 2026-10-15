@@ -29,6 +29,7 @@
 #include <activation.h>
 #include <unknwn.h>
 #include <xgameerr.h>
+#include <xasync.h>
 #include <xtaskqueue.h>
 
 #include "wine/test.h"
@@ -64,10 +65,12 @@ struct threading_vtbl
     HRESULT (WINAPI *QueryInterface)( threading_iface *iface, REFIID iid, void **out );
     ULONG (WINAPI *AddRef)( threading_iface *iface );
     ULONG (WINAPI *Release)( threading_iface *iface );
-    void *XAsyncGetStatus;
+    HRESULT (WINAPI *XAsyncGetStatus)( threading_iface *iface,
+                                      XAsyncBlock *async, BOOLEAN wait );
     void *XAsyncGetResultSize;
     void *XAsyncCancel;
-    void *XAsyncRun;
+    HRESULT (WINAPI *XAsyncRun)( threading_iface *iface,
+                                XAsyncBlock *async, XAsyncWork *work );
     void *XAsyncBegin;
     void *__PADDING__;
     void *XAsyncSchedule;
@@ -291,6 +294,86 @@ static void restore_threading_prompt( HKEY key, BOOL had_value, DWORD previous )
     RegCloseKey( key );
 }
 
+struct async_test_state
+{
+    LONG work_calls;
+    LONG completion_calls;
+};
+
+static HRESULT WINAPI async_work( XAsyncBlock *async )
+{
+    struct async_test_state *state = async->context;
+
+    ++state->work_calls;
+    return S_OK;
+}
+
+static void WINAPI async_completed( XAsyncBlock *async )
+{
+    struct async_test_state *state = async->context;
+
+    ++state->completion_calls;
+}
+
+static void test_xasync_schedule(void)
+{
+    struct async_test_state state = {0};
+    XAsyncBlock async = {0};
+    threading_iface *threading = NULL;
+    query_api_impl_fn query_api;
+    BOOL had_value = FALSE;
+    DWORD previous = 0;
+    WCHAR module_path[MAX_PATH];
+    HMODULE module;
+    HKEY key;
+    HRESULT hr;
+
+    key = suppress_threading_prompt( &had_value, &previous );
+    ok( !!key, "failed to suppress the legacy threading prompt\n" );
+    if (!key) return;
+    if (!GetEnvironmentVariableW( L"XGAMERUNTIME_TEST_DLL", module_path, ARRAY_SIZE(module_path) ))
+        lstrcpyW( module_path, L"xgameruntime.dll" );
+    module = LoadLibraryW( module_path );
+    ok( !!module, "failed to load xgameruntime.dll, error %lu\n", GetLastError() );
+    if (!module) goto done;
+    query_api = (query_api_impl_fn)GetProcAddress( module, "QueryApiImpl" );
+    ok( !!query_api, "QueryApiImpl export is missing\n" );
+    if (!query_api) goto done;
+    hr = query_api( &CLSID_XThreadingImpl, &CLSID_XThreadingImpl, (void **)&threading );
+    ok( hr == S_OK && !!threading, "QueryApiImpl(XThreading) returned %#lx, %p\n", hr, threading );
+    if (!threading) goto done;
+    hr = threading->lpVtbl->XTaskQueueCreate( threading, XTaskQueueDispatchMode_Manual,
+                                              XTaskQueueDispatchMode_Manual, &async.queue );
+    ok( hr == S_OK, "XTaskQueueCreate returned %#lx\n", hr );
+    if (FAILED(hr)) goto done;
+
+    async.context = &state;
+    async.callback = async_completed;
+    /* Run with WINEDEBUG=+gdkc too: scheduling must not trace a detached state. */
+    hr = threading->lpVtbl->XAsyncRun( threading, &async, async_work );
+    ok( hr == S_OK, "XAsyncRun returned %#lx\n", hr );
+    if (FAILED(hr)) goto done;
+    hr = threading->lpVtbl->XAsyncGetStatus( threading, &async, FALSE );
+    ok( hr == E_PENDING, "unscheduled work status %#lx\n", hr );
+    ok( !state.work_calls && !state.completion_calls, "manual queue ran early\n" );
+    ok( threading->lpVtbl->XTaskQueueDispatch( threading, async.queue, XTaskQueuePort_Work, 1000 ),
+        "work dispatch failed\n" );
+    ok( state.work_calls == 1 && !state.completion_calls, "unexpected work/completion count %ld/%ld\n",
+        state.work_calls, state.completion_calls );
+    ok( threading->lpVtbl->XTaskQueueDispatch( threading, async.queue, XTaskQueuePort_Completion, 1000 ),
+        "completion dispatch failed\n" );
+    hr = threading->lpVtbl->XAsyncGetStatus( threading, &async, FALSE );
+    ok( hr == S_OK, "completed work status %#lx\n", hr );
+    ok( state.work_calls == 1 && state.completion_calls == 1, "unexpected final counts %ld/%ld\n",
+        state.work_calls, state.completion_calls );
+
+done:
+    if (threading && async.queue) threading->lpVtbl->XTaskQueueCloseHandle( threading, async.queue );
+    if (threading) threading->lpVtbl->Release( threading );
+    if (module) FreeLibrary( module );
+    restore_threading_prompt( key, had_value, previous );
+}
+
 static void test_xgameinvite_relay(void)
 {
     static const char expected_uri[] =
@@ -493,6 +576,7 @@ done:
 
 START_TEST(xgameruntime)
 {
+    test_xasync_schedule();
     test_xgameui_query();
     test_xgameinvite_query();
     test_xgameinvite_relay();
